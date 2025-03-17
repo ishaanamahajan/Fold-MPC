@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-import gym
+import gymnasium as gym
 import pickle
 from torch.utils.data import Dataset, DataLoader
 import os
@@ -22,7 +22,7 @@ print(f"Using device: {device}")
 CONFIG = {
     'data': {
         'num_episodes': 10000,  # Number of episodes to collect
-        'data_file': 'cartpole_data.pkl',
+        'data_file': 'data/cartpole_data.pkl',  # Add data directory to path
     },
     'model': {
         'hidden_layers': [64, 64, 64],  # Hidden layer sizes
@@ -35,9 +35,9 @@ CONFIG = {
     'save_dir': 'models',
 }
 
-def collect_cartpole_data(num_episodes=10000, save_path='cartpole_data.pkl'):
+def collect_cartpole_data(num_episodes=10000, save_path='data/cartpole_data.pkl'):
     """Collect data from random policy interactions with CartPole"""
-    env = gym.make("CartPole-v1")
+    env = gym.make("CartPole-v1", render_mode=None)
     
     data = []
     total_steps = 0
@@ -46,11 +46,10 @@ def collect_cartpole_data(num_episodes=10000, save_path='cartpole_data.pkl'):
         episode = []
         obs, _ = env.reset()
         
-        done = False
-        while not done:
-            action = env.action_space.sample()  # Random action
-            next_obs, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
+        terminated = truncated = False
+        while not (terminated or truncated):
+            action = env.action_space.sample()
+            next_obs, _, terminated, truncated, _ = env.step(action)
             
             # Store transition: (state, action, next_state)
             transition = np.concatenate([obs, [action], next_obs])
@@ -58,16 +57,17 @@ def collect_cartpole_data(num_episodes=10000, save_path='cartpole_data.pkl'):
             
             obs = next_obs
             total_steps += 1
-            
-            if done:
-                break
         
         data.append(np.array(episode))
     
     print(f"Collected {total_steps} total steps across {num_episodes} episodes")
     
+    # Create data directory if it doesn't exist
+    directory = os.path.dirname(save_path)
+    if directory:  # Only try to create directory if path is not empty
+        os.makedirs(directory, exist_ok=True)
+    
     # Save the data
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     with open(save_path, 'wb') as f:
         pickle.dump(data, f)
     
@@ -208,12 +208,16 @@ def train_dynamics_model(data, config):
     # Create directory for saving models
     os.makedirs(config['save_dir'], exist_ok=True)
     
+    print("\nStarting training...")
     for epoch in range(config['model']['epochs']):
+        print(f"\nEpoch {epoch+1}/{config['model']['epochs']}")
+        
         # Training
         model.train()
         train_loss = 0.0
         
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['model']['epochs']} (Train)"):
+        train_pbar = tqdm(train_loader, desc=f"Training", leave=False)
+        for batch in train_pbar:
             state = batch['state'].to(device)
             action = batch['action'].to(device)
             next_state = batch['next_state'].to(device)
@@ -230,6 +234,7 @@ def train_dynamics_model(data, config):
             optimizer.step()
             
             train_loss += loss.item()
+            train_pbar.set_postfix({'loss': f'{loss.item():.6f}'})
         
         train_loss /= len(train_loader)
         train_losses.append(train_loss)
@@ -238,8 +243,9 @@ def train_dynamics_model(data, config):
         model.eval()
         val_loss = 0.0
         
+        val_pbar = tqdm(val_loader, desc=f"Validation", leave=False)
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{config['model']['epochs']} (Val)"):
+            for batch in val_pbar:
                 state = batch['state'].to(device)
                 action = batch['action'].to(device)
                 next_state = batch['next_state'].to(device)
@@ -250,17 +256,18 @@ def train_dynamics_model(data, config):
                 # Compute loss
                 loss = criterion(pred_next_state, next_state)
                 val_loss += loss.item()
+                val_pbar.set_postfix({'loss': f'{loss.item():.6f}'})
         
         val_loss /= len(val_loader)
         val_losses.append(val_loss)
         
-        print(f"Epoch {epoch+1}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+        print(f"Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), os.path.join(config['save_dir'], 'best_dynamics_model.pt'))
-            print(f"New best model saved!")
+            print(f"New best model saved! (val_loss: {val_loss:.6f})")
     
     # Save final model
     torch.save(model.state_dict(), os.path.join(config['save_dir'], 'final_dynamics_model.pt'))
@@ -281,14 +288,15 @@ def train_dynamics_model(data, config):
 def test_dynamics_model(model, episodes=5, render=True):
     """Test the dynamics model by predicting next states and comparing to actual"""
     env = gym.make("CartPole-v1", render_mode='human' if render else None)
+    model.eval()  # Add this line to put model in evaluation mode
     
     for episode in range(episodes):
         obs, _ = env.reset()
         total_error = 0
         num_steps = 0
         
-        done = False
-        while not done and num_steps < 200:  # Cap at 200 steps
+        terminated = truncated = False
+        while not (terminated or truncated) and num_steps < 200:  # Updated termination check
             if render:
                 env.render()
             
@@ -304,7 +312,6 @@ def test_dynamics_model(model, episodes=5, render=True):
             
             # Get actual next state
             next_obs, _, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
             
             # Compute error
             error = np.mean((pred_next_state - next_obs) ** 2)
